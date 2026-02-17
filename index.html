@@ -273,47 +273,121 @@ function stopTimer(){
   activeTimer=null;timerInterval=null;S.timerSeconds=0;render();
 }
 
-// Browser Notifications
-let notifiedTasks=new Set();
-function requestNotifPermission(){
-  if("Notification" in window && Notification.permission==="default"){
-    Notification.requestPermission();
+// ═══ NTFY PUSH NOTIFICATIONS ═══
+// Each member subscribes to their own topic: assist-{sanitized-email}
+let ntfySent=new Set();
+function getNtfyTopic(email){
+  if(!email)return null;
+  return"assist-"+email.replace(/[@.]/g,"-").toLowerCase();
+}
+function getMyTopic(){return getNtfyTopic(user?.email)}
+
+// Send push notification via ntfy.sh
+async function sendNtfy(topic,title,body,priority="default",tags=""){
+  try{
+    await fetch("https://ntfy.sh/"+topic,{
+      method:"POST",
+      headers:{"Title":title,"Priority":priority,"Tags":tags},
+      body:body
+    });
+  }catch(e){console.log("ntfy error:",e)}
+}
+
+// Check tasks and send reminders to assigned members
+function checkAndNotify(){
+  if(!user||!S.tasks.length)return;
+  const now=new Date();
+  S.tasks.forEach(t=>{
+    if(t.completed||!t.dueDate||!t.dueTime||!t.reminder)return;
+    const due=new Date(t.dueDate+"T"+t.dueTime+":00");
+    const diff=due-now;
+
+    // 30 min before — send to all assignees
+    if(diff>0&&diff<=1800000&&!ntfySent.has(t.id+"_soon")){
+      ntfySent.add(t.id+"_soon");
+      const mins=Math.round(diff/60000);
+      (t.assignees||[]).forEach(aid=>{
+        const m=S.members.find(x=>x.id===aid);
+        if(!m?.email)return;
+        const topic=getNtfyTopic(m.email);
+        if(topic)sendNtfy(topic,
+          `⏰ Task Due in ${mins} min`,
+          `"${t.title}" is due at ${t.dueTime}`,
+          "high","alarm_clock");
+      });
+    }
+
+    // Overdue — send to all assignees
+    if(diff<0&&diff>-120000&&!ntfySent.has(t.id+"_overdue")){
+      ntfySent.add(t.id+"_overdue");
+      (t.assignees||[]).forEach(aid=>{
+        const m=S.members.find(x=>x.id===aid);
+        if(!m?.email)return;
+        const topic=getNtfyTopic(m.email);
+        if(topic)sendNtfy(topic,
+          `⚠️ Task Overdue!`,
+          `"${t.title}" was due at ${t.dueTime}`,
+          "urgent","warning");
+      });
+    }
+
+    // Follow-up: 1 hour overdue
+    if(diff<-3600000&&diff>-3660000&&!ntfySent.has(t.id+"_followup")){
+      ntfySent.add(t.id+"_followup");
+      (t.assignees||[]).forEach(aid=>{
+        const m=S.members.find(x=>x.id===aid);
+        if(!m?.email)return;
+        const topic=getNtfyTopic(m.email);
+        if(topic)sendNtfy(topic,
+          `🔔 Follow-up: Still pending`,
+          `"${t.title}" has been overdue for 1 hour`,
+          "high","bell");
+      });
+    }
+  });
+
+  // Daily morning summary at ~8-9am (runs once)
+  const h=now.getHours();
+  if(h>=8&&h<9&&!ntfySent.has("daily_"+today())){
+    ntfySent.add("daily_"+today());
+    const myTasks=S.tasks.filter(t=>!t.completed&&t.assignees?.includes(user.uid)&&t.dueDate===today());
+    if(myTasks.length){
+      const topic=getMyTopic();
+      if(topic)sendNtfy(topic,
+        `📋 You have ${myTasks.length} task${myTasks.length>1?"s":""} due today`,
+        myTasks.map(t=>`• ${t.title}${t.dueTime?" at "+t.dueTime:""}`).join("\n"),
+        "default","clipboard");
+    }
   }
 }
-function checkNotifications(){
+// Check every 30 seconds
+setInterval(checkAndNotify,30000);
+
+// Also keep browser notifications as backup
+let browserNotified=new Set();
+function requestNotifPermission(){
+  if("Notification" in window && Notification.permission==="default")Notification.requestPermission();
+}
+function checkBrowserNotif(){
   if(!user||!("Notification" in window)||Notification.permission!=="granted")return;
   const now=new Date();
   S.tasks.forEach(t=>{
     if(t.completed||!t.dueDate||!t.dueTime||!t.reminder)return;
     if(!t.assignees?.includes(user.uid))return;
-    if(notifiedTasks.has(t.id))return;
+    if(browserNotified.has(t.id))return;
     const due=new Date(t.dueDate+"T"+t.dueTime+":00");
     const diff=due-now;
-    // Notify 30 min before
     if(diff>0&&diff<=1800000){
-      notifiedTasks.add(t.id);
-      const mins=Math.round(diff/60000);
-      new Notification("⏰ Assist — Task Due Soon",{
-        body:`"${t.title}" is due in ${mins} minute${mins!==1?"s":""}`,
-        icon:"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>✦</text></svg>",
-        tag:t.id,
-        requireInteraction:true
-      });
+      browserNotified.add(t.id);
+      new Notification("⏰ Task Due Soon",{body:`"${t.title}" is due in ${Math.round(diff/60000)} min`,tag:t.id});
     }
-    // Notify when overdue
     if(diff<0&&diff>-60000){
-      notifiedTasks.add(t.id+"_overdue");
-      new Notification("⚠️ Assist — Task Overdue!",{
-        body:`"${t.title}" is now overdue!`,
-        icon:"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚠️</text></svg>",
-        tag:t.id+"_od",
-        requireInteraction:true
-      });
+      browserNotified.add(t.id+"_od");
+      new Notification("⚠️ Task Overdue!",{body:`"${t.title}" is now overdue!`,tag:t.id+"_od"});
     }
   });
 }
-// Check every 30 seconds
-setInterval(checkNotifications,30000);
+setInterval(checkBrowserNotif,30000);
 
 // Export CSV
 function exportCSV(){
@@ -481,6 +555,20 @@ function parseAct(t){const m=t.match(/###TASK_ACTION###\s*([\s\S]*?)\s*###END_AC
 function stripAct(t){return t.replace(/###TASK_ACTION###[\s\S]*?###END_ACTION###/,"").trim()}
 
 // ═══ SEND MESSAGE (Smart Parser first, then Gemini) ═══
+// Notify assignees when a task is created/assigned
+function notifyAssignees(title,assignees,dueDate,dueTime,creatorName){
+  (assignees||[]).forEach(aid=>{
+    if(aid===user?.uid)return; // don't notify yourself
+    const m=S.members.find(x=>x.id===aid);
+    if(!m?.email)return;
+    const topic=getNtfyTopic(m.email);
+    if(topic)sendNtfy(topic,
+      `📋 New task assigned to you`,
+      `"${title}"${dueDate?" — Due: "+fmtDT(dueDate,dueTime):""}\nAssigned by ${creatorName}`,
+      "default","inbox_tray");
+  });
+}
+
 async function sendMsg(){
   if(!S.input.trim()||S.sending)return;
   const raw=S.input.trim();
@@ -493,6 +581,7 @@ async function sendMsg(){
     const ra=parsed.assignees.length?parsed.assignees:[user.uid];
     const subs=parsed.subtasks.map(s=>({id:uid(),text:s,done:false}));
     fbS({id:uid(),title:parsed.title,description:"",category:parsed.category,quadrant:parsed.quadrant,dueDate:parsed.dueDate,dueTime:parsed.dueTime,scope:parsed.scope,assignees:ra,reminder:parsed.reminder,recurring:parsed.recurring,completed:false,createdBy:user.uid,createdAt:new Date().toISOString(),comments:[],subtasks:subs,timeSpent:0});
+    notifyAssignees(parsed.title,ra,parsed.dueDate,parsed.dueTime,user?.displayName||"Someone");
 
     // Build confirmation message
     const assignNames=ra.map(id=>S.members.find(m=>m.id===id)?.name||"You").join(", ");
@@ -517,6 +606,7 @@ async function sendMsg(){
       const ra=(act.assignees||[]).map(n=>{const f=S.members.find(m=>m.name.toLowerCase()===n.toLowerCase());return f?.id}).filter(Boolean);
       const subs=(act.subtasks||[]).map(s=>({id:uid(),text:s,done:false}));
       fbS({id:uid(),title:act.title||"Untitled",description:"",category:act.category||"project",quadrant:act.quadrant||"do",dueDate:act.dueDate||"",dueTime:act.dueTime||"",scope:act.scope||"shared",assignees:ra.length?ra:[user.uid],reminder:act.reminder===true,recurring:act.recurring||"none",completed:false,createdBy:user.uid,createdAt:new Date().toISOString(),comments:[],subtasks:subs,timeSpent:0});
+      notifyAssignees(act.title||"Untitled",ra.length?ra:[user.uid],act.dueDate,act.dueTime,user?.displayName||"Someone");
     }else if(act.action==="update"&&act.taskId){
       const t=S.tasks.find(x=>x.id===act.taskId);if(t){
         const ra=act.assignees?act.assignees.map(n=>{const f=S.members.find(m=>m.name.toLowerCase()===n.toLowerCase());return f?.id}).filter(Boolean):undefined;
@@ -535,7 +625,9 @@ function addSubtaskToTask(){if(!S.newSubtask.trim()||!S.selectedTask)return;cons
 function subForm(){
   if(!S.fT.trim())return;
   const t={id:S.editTask?.id||uid(),title:S.fT.trim(),description:S.fD.trim(),category:S.fCat,quadrant:S.fQ,dueDate:S.fDt,dueTime:S.fTm,reminder:S.fRem,scope:S.fSc,assignees:S.fAs,recurring:S.fRecur,completed:S.editTask?.completed||false,createdBy:S.editTask?.createdBy||user.uid,createdAt:S.editTask?.createdAt||new Date().toISOString(),comments:S.editTask?.comments||[],subtasks:S.editTask?.subtasks||S.fSubtasks.map(s=>({id:uid(),text:s,done:false})),timeSpent:S.editTask?.timeSpent||0};
-  fbS(t);rstForm();render();
+  fbS(t);
+  if(!S.editTask)notifyAssignees(t.title,t.assignees,t.dueDate,t.dueTime,user?.displayName||"Someone");
+  rstForm();render();
 }
 function rstForm(){S.fT="";S.fD="";S.fCat="project";S.fQ="do";S.fDt="";S.fTm="";S.fRem=false;S.fSc="shared";S.fAs=[];S.fRecur="none";S.fSubtasks=[];S.newSubtask="";S.editTask=null;S.showTaskForm=false}
 function openEd(t){S.fT=t.title;S.fD=t.description||"";S.fCat=t.category;S.fQ=t.quadrant;S.fDt=t.dueDate||"";S.fTm=t.dueTime||"";S.fRem=t.reminder||false;S.fSc=t.scope||"shared";S.fAs=t.assignees||[];S.fRecur=t.recurring||"none";S.editTask=t;S.showTaskForm=true;S.selectedTask=null;render()}
@@ -575,9 +667,11 @@ function render(){
   </nav></header>
   <div class="sync-bar"><span class="sync-dot ${S.syncStatus}"></span><span>${S.syncStatus==="online"?"Synced":"Offline"}</span><span style="margin-left:auto">${S.members.length} member${S.members.length!==1?"s":""}</span></div>`;
 
-  // Notification permission banner
-  if("Notification" in window && Notification.permission==="default"){
-    h+=`<div style="display:flex;align-items:center;gap:8px;padding:8px 16px;background:rgba(46,134,193,.06);border-bottom:1px solid rgba(46,134,193,.15)"><span style="font-size:12px">🔔</span><span style="font-size:11px;color:var(--blue);flex:1">Enable browser notifications to get reminders when tasks are due</span><button style="padding:4px 10px;border-radius:6px;background:var(--blue);color:#fff;font-size:10px;font-weight:600" id="enable-notif">Enable</button></div>`;
+  // Notification setup banner
+  const myTopic=getMyTopic();
+  const ntfySetup=localStorage.getItem("wa-ntfy-setup-"+user?.uid);
+  if(myTopic&&!ntfySetup){
+    h+=`<div style="display:flex;align-items:center;gap:8px;padding:8px 16px;background:rgba(46,134,193,.06);border-bottom:1px solid rgba(46,134,193,.15)"><span style="font-size:12px">📱</span><span style="font-size:11px;color:var(--blue);flex:1">Get push notifications on your phone! Install the <b>ntfy</b> app and subscribe to: <b>${myTopic}</b></span><button style="padding:4px 10px;border-radius:6px;background:var(--blue);color:#fff;font-size:10px;font-weight:600" id="ntfy-done">Done ✓</button><button style="padding:4px 8px;border-radius:6px;font-size:10px;color:var(--tx3)" id="ntfy-dismiss">Later</button></div>`;
   }
 
   if(S.view==="chat"&&(overdue.length||dueToday.length||dueSoon.length)){h+=`<div class="alert-bar">${overdue.length?`<span class="alert alert-red">⚠ ${overdue.length} overdue</span>`:""}${dueSoon.length?`<span class="alert alert-orange">🔔 ${dueSoon.length} due soon!</span>`:""}${dueToday.length?`<span class="alert alert-blue">📅 ${dueToday.length} due today</span>`:""}</div>`}
@@ -724,6 +818,8 @@ function bindEv(){
   document.getElementById("signout")?.addEventListener("click",signOut);
   document.getElementById("theme-btn")?.addEventListener("click",toggleTheme);
   document.getElementById("enable-notif")?.addEventListener("click",()=>{Notification.requestPermission().then(()=>render())});
+  document.getElementById("ntfy-done")?.addEventListener("click",()=>{localStorage.setItem("wa-ntfy-setup-"+user?.uid,"1");render()});
+  document.getElementById("ntfy-dismiss")?.addEventListener("click",()=>{localStorage.setItem("wa-ntfy-setup-"+user?.uid,"1");render()});
   document.getElementById("bk")?.addEventListener("click",closeAll);
   document.getElementById("export-csv")?.addEventListener("click",exportCSV);
   document.getElementById("export-csv2")?.addEventListener("click",exportCSV);
