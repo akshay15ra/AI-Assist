@@ -250,7 +250,7 @@ function checkRecurring(){
       else if(t.recurring==="monthly")nextDate.setMonth(nextDate.getMonth()+1);
     }
     const nd=nextDate.toISOString().split("T")[0];
-    const nt={...t,id:uid(),completed:false,dueDate:nd,createdAt:new Date().toISOString(),comments:[],subtasks:(t.subtasks||[]).map(s=>({...s,done:false})),timeSpent:0};
+    const nt={...t,id:uid(),completed:false,dueDate:nd,createdAt:new Date().toISOString(),createdBy:t.createdBy||user?.uid,comments:[],subtasks:(t.subtasks||[]).map(s=>({...s,done:false})),timeSpent:0};
     fbS(nt);fbS({...t,lastRecurred:td});
   });
 }
@@ -317,8 +317,9 @@ setInterval(checkNotifications,30000);
 
 // Export CSV
 function exportCSV(){
+  const canSee=t=>t.createdBy===user?.uid||t.assignees?.includes(user?.uid)||(!t.createdBy);
   const headers=["Title","Category","Priority","Due Date","Due Time","Status","Scope","Assigned To","Recurring","Time Spent (min)","Subtasks","Created"];
-  const rows=S.tasks.map(t=>{
+  const rows=S.tasks.filter(canSee).map(t=>{
     const assignees=(t.assignees||[]).map(a=>S.members.find(m=>m.id===a)?.name||"?").join("; ");
     const subtasks=(t.subtasks||[]).map(s=>`${s.done?"[x]":"[ ]"} ${s.text}`).join(" | ");
     return[t.title,t.category,t.quadrant,t.dueDate||"",t.dueTime||"",t.completed?"Done":"Active",t.scope,assignees,t.recurring||"none",Math.round((t.timeSpent||0)/60),subtasks,t.createdAt?.split("T")[0]||""].map(v=>`"${String(v).replace(/"/g,'""')}"`).join(",");
@@ -328,36 +329,194 @@ function exportCSV(){
   const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=`assist-tasks-${today()}.csv`;a.click();
 }
 
-// AI
-async function askAI(msgs){
+// ═══ SMART PARSER ═══
+function parseNaturalLang(input){
+  const txt=input.toLowerCase().trim();
+  // Check if it's a question/conversation (send to AI)
+  const questionWords=["what","how","why","when","which","who","should","can","could","would","give me","tell me","help me","show me","summarize","analyse","analyze","overview","check","review my","status","focus","priority","priorities","advice","suggest","recommend"];
+  if(questionWords.some(q=>txt.startsWith(q))||txt.endsWith("?")||txt.includes("what should")||txt.includes("how many")||txt.includes("daily check"))return null;
+
+  let title="",assignees=[],dueDate="",dueTime="",quadrant="do",category="project",recurring="none",reminder=true,scope="shared",subtasks=[];
+  const now=new Date();
+
+  // Extract "assign to X" / "for X" / "to X"
+  const assignMatch=input.match(/(?:assign(?:ed)?(?:\s+(?:it|this|task))?\s+to|for)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)/i);
+  if(assignMatch){
+    const name=assignMatch[1].trim();
+    const member=S.members.find(m=>m.name.toLowerCase().includes(name.toLowerCase()));
+    if(member)assignees.push(member.id);
+  }
+
+  // Extract recurring
+  if(/\bevery\s+day\b|\bdaily\b/i.test(txt))recurring="daily";
+  else if(/\bevery\s+week\b|\bweekly\b|\bevery\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i.test(txt))recurring="weekly";
+  else if(/\bevery\s+month\b|\bmonthly\b/i.test(txt))recurring="monthly";
+
+  // Extract time
+  const timeMatch=input.match(/(?:at|by|before)\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm|AM|PM)?/i);
+  if(timeMatch){
+    let h=parseInt(timeMatch[1]),m=parseInt(timeMatch[2]||"0");
+    const ap=(timeMatch[3]||"").toLowerCase();
+    if(ap==="pm"&&h<12)h+=12;if(ap==="am"&&h===12)h=0;
+    dueTime=`${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}`;
+  }
+  if(/\bEOD\b|\bend of day\b/i.test(txt))dueTime="17:00";
+  if(/\bmorning\b/i.test(txt)&&!dueTime)dueTime="09:00";
+  if(/\bnoon\b|\bmidday\b/i.test(txt)&&!dueTime)dueTime="12:00";
+  if(/\bafternoon\b/i.test(txt)&&!dueTime)dueTime="14:00";
+
+  // Extract relative time "in X minutes/hours"
+  const relMatch=input.match(/in\s+(\d+)\s+(minute|min|hour|hr)s?\b/i);
+  if(relMatch){
+    const val=parseInt(relMatch[1]),unit=relMatch[2].toLowerCase();
+    const future=new Date(now.getTime()+(unit.startsWith("h")?val*3600000:val*60000));
+    dueDate=future.toISOString().split("T")[0];
+    dueTime=`${String(future.getHours()).padStart(2,"0")}:${String(future.getMinutes()).padStart(2,"0")}`;
+  }
+
+  // Extract date
+  const dayNames=["sunday","monday","tuesday","wednesday","thursday","friday","saturday"];
+  const dayMatch=txt.match(/\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i);
+  if(dayMatch&&!dueDate){
+    const target=dayNames.indexOf(dayMatch[1].toLowerCase());
+    const d=new Date(now);d.setHours(0,0,0,0);
+    let diff=target-d.getDay();if(diff<=0)diff+=7;
+    d.setDate(d.getDate()+diff);dueDate=d.toISOString().split("T")[0];
+  }
+  if(/\btoday\b/i.test(txt)&&!dueDate)dueDate=today();
+  if(/\btomorrow\b/i.test(txt)&&!dueDate){const d=new Date(now);d.setDate(d.getDate()+1);dueDate=d.toISOString().split("T")[0]}
+  if(/\bnext week\b/i.test(txt)&&!dueDate){const d=new Date(now);d.setDate(d.getDate()+7);dueDate=d.toISOString().split("T")[0]}
+  // Explicit date
+  const dateMatch=input.match(/(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?/);
+  if(dateMatch&&!dueDate){const y=dateMatch[3]?dateMatch[3].length===2?"20"+dateMatch[3]:dateMatch[3]:String(now.getFullYear());dueDate=`${y}-${String(dateMatch[1]).padStart(2,"0")}-${String(dateMatch[2]).padStart(2,"0")}`}
+
+  // Extract priority
+  if(/\burgent\b|\basap\b|\bcritical\b|\bemergency\b|\bimmediate\b/i.test(txt))quadrant="do";
+  else if(/\bimportant\b|\bschedule\b|\bplan\b/i.test(txt))quadrant="schedule";
+  else if(/\bdelegate\b/i.test(txt))quadrant="delegate";
+  else if(/\blow priority\b|\blater\b|\bsomeday\b|\bwhenever\b/i.test(txt))quadrant="eliminate";
+  else if(dueDate){const d=new Date(dueDate+"T"+(dueTime||"23:59")+":00");const diff=d-now;quadrant=diff<86400000?"do":diff<259200000?"schedule":"schedule"}
+
+  // Extract category
+  if(/\bmeeting\b|\bcall\b|\bsync\b|\bstandup\b/i.test(txt))category="meeting";
+  else if(/\bdeadline\b|\bsubmit\b|\bdue\b/i.test(txt))category="deadline";
+  else if(/\breview\b|\bcheck\b|\bfeedback\b|\bapprove\b/i.test(txt))category="review";
+  else if(/\bplan\b|\bstrategy\b|\broadmap\b/i.test(txt))category="planning";
+  else if(/\badmin\b|\bpaper\b|\bfile\b|\bform\b/i.test(txt))category="admin";
+  else if(/\bpersonal\b|\bgym\b|\bdoctor\b|\bhome\b/i.test(txt)){category="personal";scope="personal"}
+
+  // Extract subtasks "with subtasks: a, b, c"
+  const subMatch=input.match(/(?:with\s+)?subtasks?[:\s]+(.+)/i);
+  if(subMatch)subtasks=subMatch[1].split(/[,;]/).map(s=>s.trim()).filter(Boolean);
+
+  // Extract scope
+  if(/\bpersonal\b|\bprivate\b|\bjust me\b|\bonly me\b/i.test(txt))scope="personal";
+
+  // Clean title: remove parsed parts
+  title=input
+    .replace(/(?:assign(?:ed)?(?:\s+(?:it|this|task))?\s+to|for)\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?/i,"")
+    .replace(/(?:at|by|before)\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?/i,"")
+    .replace(/\b(?:today|tomorrow|next week|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i,"")
+    .replace(/\b(?:EOD|end of day|morning|noon|afternoon)\b/i,"")
+    .replace(/\bin\s+\d+\s+(?:minute|min|hour|hr)s?\b/i,"")
+    .replace(/\b(?:urgent|asap|critical|important|low priority|later)\b/i,"")
+    .replace(/\b(?:every\s+(?:day|week|month|monday|tuesday|wednesday|thursday|friday|saturday|sunday)|daily|weekly|monthly)\b/i,"")
+    .replace(/(?:with\s+)?subtasks?[:\s]+.+/i,"")
+    .replace(/\b(?:personal|private|shared)\b/i,"")
+    .replace(/\b(?:remind me to|remind me|please|can you|add task)\b/i,"")
+    .replace(/\d{1,2}[\/\-]\d{1,2}(?:[\/\-]\d{2,4})?/,"")
+    .replace(/\s{2,}/g," ").trim();
+
+  if(!title||title.length<2)return null;
+  // Capitalize first letter
+  title=title.charAt(0).toUpperCase()+title.slice(1);
+
+  return{title,assignees,dueDate,dueTime,quadrant,category,recurring,reminder,scope,subtasks};
+}
+
+// ═══ GEMINI AI ═══
+const GEMINI_KEY="AIzaSyDWTtduPc4bh8NfMTb55uJ7DI9BD3fjwA4";
+async function askGemini(msgs){
   const ml=S.members.map(m=>`${m.name} (${m.role})`).join(", ");
   const ts=S.tasks.filter(t=>!t.completed).slice(0,25).map(t=>{
     const a=t.assignees?.map(id=>S.members.find(m=>m.id===id)?.name||"?").join(",")||"unassigned";
     return`- "${t.title}" [${t.quadrant}][${t.category}][${t.scope}] by:${a}${t.dueDate?` due:${t.dueDate}`:""}${t.dueTime?` ${t.dueTime}`:""}${t.recurring&&t.recurring!=="none"?` recurring:${t.recurring}`:""}`;
   }).join("\n");
-  const sys=`You are a concise work productivity assistant for ${user?.displayName}. Eisenhower matrix, team collab.
-TEAM: ${ml||"No members"} | TASKS:\n${ts}\nTODAY: ${today()} ${nowT()}
-RULES: Work default. "shared" scope default. Classify quadrant. Assign by name. SHORT (2-4 sentences). Times: EOD=17:00,morning=09:00,noon=12:00,afternoon=14:00. Recurring: none/daily/weekly/monthly.
-ACTION at end:
+  const sysPrompt=`You are a concise work productivity assistant for ${user?.displayName}. You use the Eisenhower matrix for task prioritization.
+TEAM MEMBERS: ${ml||"No members yet"}
+CURRENT TASKS:\n${ts||"No tasks yet"}
+TODAY: ${today()} ${nowT()}
+RULES:
+- Be SHORT and helpful (2-4 sentences max)
+- When user asks what to focus on, prioritize by quadrant and due date
+- Give specific, actionable advice
+- If user asks to add/create a task, output an action block at the end
+- Times: EOD=17:00, morning=09:00, noon=12:00, afternoon=14:00
+
+If user wants to create/add/update a task, output this at the end of your response:
 ###TASK_ACTION###
-{"action":"add","title":"...","category":"...","quadrant":"...","dueDate":"YYYY-MM-DD|null","dueTime":"HH:MM|null","scope":"shared|personal","assignees":["name"],"reminder":true/false,"recurring":"none|daily|weekly|monthly","subtasks":["item1","item2"]}
+{"action":"add","title":"...","category":"project|meeting|deadline|review|planning|admin|personal","quadrant":"do|schedule|delegate|eliminate","dueDate":"YYYY-MM-DD or null","dueTime":"HH:MM or null","scope":"shared|personal","assignees":["member name"],"reminder":true,"recurring":"none|daily|weekly|monthly","subtasks":["step 1","step 2"]}
 ###END_ACTION###
-Updates: {"action":"update","taskId":"...","quadrant":"...","assignees":["name"],"dueDate":"...","dueTime":"..."}`;
-  try{const r=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:1000,system:sys,messages:msgs.slice(-20).map(m=>({role:m.role,content:m.content}))})});const d=await r.json();return d.content?.map(b=>b.text||"").join("")||"Something went wrong."}catch{return"Connection issue. Try again."}
+For updates: {"action":"update","taskId":"...","quadrant":"...","assignees":["name"],"dueDate":"...","dueTime":"..."}`;
+
+  const history=msgs.slice(-16).map(m=>({role:m.role==="assistant"?"model":"user",parts:[{text:m.content}]}));
+
+  try{
+    const r=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_KEY}`,{
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({
+        system_instruction:{parts:[{text:sysPrompt}]},
+        contents:history,
+        generationConfig:{maxOutputTokens:800,temperature:0.7}
+      })
+    });
+    const d=await r.json();
+    if(d.candidates?.[0]?.content?.parts?.[0]?.text)return d.candidates[0].content.parts[0].text;
+    if(d.error)return"AI unavailable: "+(d.error.message||"Try again later.");
+    return"Something went wrong. Try again.";
+  }catch(e){return"Connection issue. Check your internet and try again."}
 }
 function parseAct(t){const m=t.match(/###TASK_ACTION###\s*([\s\S]*?)\s*###END_ACTION###/);if(!m)return null;try{return JSON.parse(m[1].trim())}catch{return null}}
 function stripAct(t){return t.replace(/###TASK_ACTION###[\s\S]*?###END_ACTION###/,"").trim()}
 
-// Actions
+// ═══ SEND MESSAGE (Smart Parser first, then Gemini) ═══
 async function sendMsg(){
   if(!S.input.trim()||S.sending)return;
-  S.messages.push({role:"user",content:S.input.trim()});S.input="";S.sending=true;render();scrollC();
-  const reply=await askAI(S.messages);const act=parseAct(reply),clean=stripAct(reply);
+  const raw=S.input.trim();
+  S.messages.push({role:"user",content:raw});S.input="";S.sending=true;render();scrollC();
+
+  // Try smart parser first
+  const parsed=parseNaturalLang(raw);
+  if(parsed){
+    // Smart parser handled it — create task directly
+    const ra=parsed.assignees.length?parsed.assignees:[user.uid];
+    const subs=parsed.subtasks.map(s=>({id:uid(),text:s,done:false}));
+    fbS({id:uid(),title:parsed.title,description:"",category:parsed.category,quadrant:parsed.quadrant,dueDate:parsed.dueDate,dueTime:parsed.dueTime,scope:parsed.scope,assignees:ra,reminder:parsed.reminder,recurring:parsed.recurring,completed:false,createdBy:user.uid,createdAt:new Date().toISOString(),comments:[],subtasks:subs,timeSpent:0});
+
+    // Build confirmation message
+    const assignNames=ra.map(id=>S.members.find(m=>m.id===id)?.name||"You").join(", ");
+    let conf=`✅ Created: "${parsed.title}"`;
+    if(parsed.dueDate)conf+=`\n📅 Due: ${fmtDT(parsed.dueDate,parsed.dueTime)}`;
+    conf+=`\n👤 Assigned to: ${assignNames}`;
+    conf+=`\n${QDS.find(q=>q.id===parsed.quadrant)?.icon} Priority: ${QDS.find(q=>q.id===parsed.quadrant)?.label}`;
+    if(parsed.recurring!=="none")conf+=`\n🔄 Recurring: ${parsed.recurring}`;
+    if(parsed.subtasks.length)conf+=`\n☑ ${parsed.subtasks.length} subtask${parsed.subtasks.length>1?"s":""}`;
+
+    S.messages.push({role:"assistant",content:conf});
+    S.sending=false;
+    if(user)localStorage.setItem("wa-msg-"+user.uid,JSON.stringify(S.messages));
+    render();scrollC();
+    return;
+  }
+
+  // Conversational — use Gemini AI
+  const reply=await askGemini(S.messages);const act=parseAct(reply),clean=stripAct(reply);
   if(act){
     if(act.action==="add"){
       const ra=(act.assignees||[]).map(n=>{const f=S.members.find(m=>m.name.toLowerCase()===n.toLowerCase());return f?.id}).filter(Boolean);
       const subs=(act.subtasks||[]).map(s=>({id:uid(),text:s,done:false}));
-      fbS({id:uid(),title:act.title||"Untitled",description:"",category:act.category||"project",quadrant:act.quadrant||"do",dueDate:act.dueDate||"",dueTime:act.dueTime||"",scope:act.scope||"shared",assignees:ra.length?ra:[user.uid],reminder:act.reminder===true,recurring:act.recurring||"none",completed:false,createdAt:new Date().toISOString(),comments:[],subtasks:subs,timeSpent:0});
+      fbS({id:uid(),title:act.title||"Untitled",description:"",category:act.category||"project",quadrant:act.quadrant||"do",dueDate:act.dueDate||"",dueTime:act.dueTime||"",scope:act.scope||"shared",assignees:ra.length?ra:[user.uid],reminder:act.reminder===true,recurring:act.recurring||"none",completed:false,createdBy:user.uid,createdAt:new Date().toISOString(),comments:[],subtasks:subs,timeSpent:0});
     }else if(act.action==="update"&&act.taskId){
       const t=S.tasks.find(x=>x.id===act.taskId);if(t){
         const ra=act.assignees?act.assignees.map(n=>{const f=S.members.find(m=>m.name.toLowerCase()===n.toLowerCase());return f?.id}).filter(Boolean):undefined;
@@ -375,7 +534,7 @@ function delSubtask(taskId,subId){const t=S.tasks.find(x=>x.id===taskId);if(!t)r
 function addSubtaskToTask(){if(!S.newSubtask.trim()||!S.selectedTask)return;const sub={id:uid(),text:S.newSubtask.trim(),done:false};const up={...S.selectedTask,subtasks:[...(S.selectedTask.subtasks||[]),sub]};fbS(up);S.selectedTask=up;S.newSubtask="";render()}
 function subForm(){
   if(!S.fT.trim())return;
-  const t={id:S.editTask?.id||uid(),title:S.fT.trim(),description:S.fD.trim(),category:S.fCat,quadrant:S.fQ,dueDate:S.fDt,dueTime:S.fTm,reminder:S.fRem,scope:S.fSc,assignees:S.fAs,recurring:S.fRecur,completed:S.editTask?.completed||false,createdAt:S.editTask?.createdAt||new Date().toISOString(),comments:S.editTask?.comments||[],subtasks:S.editTask?.subtasks||S.fSubtasks.map(s=>({id:uid(),text:s,done:false})),timeSpent:S.editTask?.timeSpent||0};
+  const t={id:S.editTask?.id||uid(),title:S.fT.trim(),description:S.fD.trim(),category:S.fCat,quadrant:S.fQ,dueDate:S.fDt,dueTime:S.fTm,reminder:S.fRem,scope:S.fSc,assignees:S.fAs,recurring:S.fRecur,completed:S.editTask?.completed||false,createdBy:S.editTask?.createdBy||user.uid,createdAt:S.editTask?.createdAt||new Date().toISOString(),comments:S.editTask?.comments||[],subtasks:S.editTask?.subtasks||S.fSubtasks.map(s=>({id:uid(),text:s,done:false})),timeSpent:S.editTask?.timeSpent||0};
   fbS(t);rstForm();render();
 }
 function rstForm(){S.fT="";S.fD="";S.fCat="project";S.fQ="do";S.fDt="";S.fTm="";S.fRem=false;S.fSc="shared";S.fAs=[];S.fRecur="none";S.fSubtasks=[];S.newSubtask="";S.editTask=null;S.showTaskForm=false}
@@ -394,7 +553,10 @@ function render(){
   }
 
   const uName=user?.displayName||user?.email?.split("@")[0]||"User";
-  const active=S.tasks.filter(t=>!t.completed);
+  // Visibility: only show tasks you created or are assigned to
+  const canSee=t=>t.createdBy===user.uid||t.assignees?.includes(user.uid)||(!t.createdBy);
+  const myTasks=S.tasks.filter(canSee);
+  const active=myTasks.filter(t=>!t.completed);
   const overdue=active.filter(t=>isOD(t.dueDate,t.dueTime));
   const dueToday=active.filter(t=>t.dueDate===today());
   const dueSoon=active.filter(t=>isDueSoon(t.dueDate,t.dueTime)&&t.reminder);
@@ -423,7 +585,7 @@ function render(){
   // CHAT
   if(S.view==="chat"){
     h+=`<div class="chat-wrap"><div class="chat-messages">`;
-    if(!S.messages.length)h+=`<div class="welcome-wrap"><div style="font-size:40px">✦</div><h2 class="welcome-title">${greet()}, ${esc(uName.split(" ")[0])}!</h2><p class="welcome-sub">Tell me what needs doing — I'll organise, assign, and set deadlines. Now with recurring tasks, time tracking, subtasks, and more!</p><div class="prompt-grid">${["What should I focus on today?","Create a weekly standup task recurring every Monday","Prepare Q3 deck by Friday 3pm with subtasks","Give me my daily check-in"].map(p=>`<button class="prompt-chip" data-prompt="${esc(p)}">${esc(p)}</button>`).join("")}</div></div>`;
+    if(!S.messages.length)h+=`<div class="welcome-wrap"><div style="font-size:40px">✦</div><h2 class="welcome-title">${greet()}, ${esc(uName.split(" ")[0])}!</h2><p class="welcome-sub">Type a task to create it instantly, or ask me a question and I'll use AI to help. Everything syncs in real-time with your team.</p><div class="prompt-grid">${["Submit report by Friday 3pm","Assign client review to Priya by Monday","What should I focus on today?","Weekly standup every Monday 9am","Give me my daily check-in"].map(p=>`<button class="prompt-chip" data-prompt="${esc(p)}">${esc(p)}</button>`).join("")}</div><p style="font-size:10px;color:var(--tx3);margin-top:10px">⚡ Task commands are instant · 🤖 Questions use Gemini AI</p></div>`;
     S.messages.forEach(m=>{h+=m.role==="user"?`<div class="msg-row user"><div class="msg-u">${esc(m.content)}</div>${user?.photoURL?pav(user.photoURL,24):av(uName,24)}</div>`:`<div class="msg-row bot"><div class="bot-av">✦</div><div class="msg-b">${esc(m.content)}</div></div>`});
     if(S.sending)h+=`<div class="msg-row bot"><div class="bot-av">✦</div><div class="msg-b"><div class="dots"><span class="dot"></span><span class="dot"></span><span class="dot"></span></div></div></div>`;
     h+=`<div id="chat-end"></div></div><div class="input-bar"><input class="chat-input" id="ci" placeholder="e.g. 'Submit report by Friday 5pm'…" value="${esc(S.input)}"><button class="send-btn" id="sb" ${!S.input.trim()||S.sending?"disabled":""}>↑</button></div></div>`;
@@ -431,11 +593,11 @@ function render(){
 
   // TASKS
   if(S.view==="tasks"&&!S.selectedTask){
-    h+=`<div class="view-wrap"><div class="view-header"><div><h2 class="view-title">Tasks</h2><p class="view-sub">${active.length} active · ${S.tasks.filter(t=>t.completed).length} done</p></div><div style="display:flex;gap:4px"><button class="export-btn" id="export-csv">📥 Export CSV</button><button class="add-btn" id="add-t">+ Add</button></div></div>
+    h+=`<div class="view-wrap"><div class="view-header"><div><h2 class="view-title">Tasks</h2><p class="view-sub">${active.length} active · ${myTasks.filter(t=>t.completed).length} done</p></div><div style="display:flex;gap:4px"><button class="export-btn" id="export-csv">📥 Export CSV</button><button class="add-btn" id="add-t">+ Add</button></div></div>
     <div class="scope-tabs">${["all","mine","shared","personal"].map(s=>`<button class="scope-tab ${S.taskScope===s?"active":""}" data-scope="${s}">${s==="all"?"All":s==="mine"?"My Tasks":s[0].toUpperCase()+s.slice(1)}</button>`).join("")}</div>`;
     if(!filtered.length)h+=`<div class="empty-state"><span style="font-size:44px">📝</span><p style="color:var(--tx3);margin-top:8px;font-size:14px">No tasks here</p></div>`;
     else QDS.forEach(q=>{const it=filtered.filter(t=>t.quadrant===q.id).sort((a,b)=>{const da=a.dueDate||"9",db2=b.dueDate||"9";return da.localeCompare(db2)});if(!it.length)return;h+=`<div style="margin-bottom:16px"><div class="quad-label"><span>${q.icon}</span><span style="color:${q.color};font-weight:700">${q.label}</span><span style="color:var(--tx3);font-size:11px">— ${q.sub}</span></div>`;it.forEach(t=>{h+=rTC(t)});h+=`</div>`});
-    const done=S.tasks.filter(t=>t.completed);
+    const done=myTasks.filter(t=>t.completed);
     if(done.length){h+=`<div style="margin-top:10px"><div class="quad-label" style="opacity:.5"><span>✓</span><span style="font-weight:700">Completed</span></div>`;done.slice(0,8).forEach(t=>{h+=rTC(t)});h+=`</div>`}
     h+=`</div>`;
   }
@@ -458,7 +620,7 @@ function render(){
     for(let i=0;i<startDay;i++){const d=daysInPrev-startDay+i+1;h+=`<div class="cal-day other"><span>${d}</span></div>`}
     for(let d=1;d<=daysInMonth;d++){
       const ds=`${S.calYear}-${String(S.calMonth+1).padStart(2,"0")}-${String(d).padStart(2,"0")}`;
-      const dayTasks=S.tasks.filter(t=>t.dueDate===ds&&!t.completed);
+      const dayTasks=myTasks.filter(t=>t.dueDate===ds&&!t.completed);
       const isToday=ds===todayStr;
       h+=`<div class="cal-day ${isToday?"today":""}"><span style="font-weight:${isToday?700:400}">${d}</span>`;
       dayTasks.slice(0,3).forEach(t=>{const q=QDS.find(x=>x.id===t.quadrant);h+=`<div style="font-size:8px;padding:1px 3px;background:${q?.bg};color:${q?.color};border-radius:3px;margin-top:1px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer" data-sel="${t.id}">${esc(t.title)}</div>`});
@@ -472,8 +634,8 @@ function render(){
 
   // DASHBOARD
   if(S.view==="dashboard"&&!S.selectedTask){
-    const total=S.tasks.length,completed=S.tasks.filter(t=>t.completed).length,activeN=total-completed;
-    const totalTime=S.tasks.reduce((a,t)=>a+(t.timeSpent||0),0);
+    const total=myTasks.length,completed=myTasks.filter(t=>t.completed).length,activeN=total-completed;
+    const totalTime=myTasks.reduce((a,t)=>a+(t.timeSpent||0),0);
     const compRate=total?Math.round(completed/total*100):0;
     h+=`<div class="view-wrap"><div class="view-header"><h2 class="view-title">Dashboard</h2><button class="export-btn" id="export-csv2">📥 Export CSV</button></div>
     <div class="stat-grid">
@@ -482,7 +644,7 @@ function render(){
       <div class="stat-card"><div class="stat-num" style="color:var(--red)">${overdue.length}</div><div class="stat-label">Overdue</div></div>
       <div class="stat-card"><div class="stat-num" style="color:var(--purple)">${fmtTimer(totalTime)}</div><div class="stat-label">Total Time Tracked</div></div>
       <div class="stat-card"><div class="stat-num">${compRate}%</div><div class="stat-label">Completion Rate</div><div class="progress-bar" style="margin-top:6px"><div class="progress-fill" style="width:${compRate}%;background:var(--green)"></div></div></div>
-      <div class="stat-card"><div class="stat-num" style="color:var(--orange)">${S.tasks.filter(t=>t.recurring&&t.recurring!=="none").length}</div><div class="stat-label">Recurring Tasks</div></div>
+      <div class="stat-card"><div class="stat-num" style="color:var(--orange)">${myTasks.filter(t=>t.recurring&&t.recurring!=="none").length}</div><div class="stat-label">Recurring Tasks</div></div>
     </div>`;
     // Tasks by quadrant chart
     h+=`<div style="background:var(--sf);border-radius:10px;padding:14px;margin-bottom:12px;box-shadow:0 1px 3px rgba(0,0,0,.04)"><span class="form-label">Tasks by Priority</span><div class="chart-bar">`;
