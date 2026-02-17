@@ -283,12 +283,13 @@ function getNtfyTopic(email){
 function getMyTopic(){return getNtfyTopic(user?.email)}
 
 // Send push notification via ntfy.sh
+function sanitizeHeader(str){return(str||"").replace(/[^\x20-\x7E]/g,"")}
 async function sendNtfy(topic,title,body,priority="default",tags=""){
   try{
     await fetch("https://ntfy.sh/"+topic,{
       method:"POST",
-      headers:{"Title":title,"Priority":priority,"Tags":tags},
-      body:body
+      headers:{"Title":sanitizeHeader(title),"Priority":priority,"Tags":tags},
+      body:sanitizeHeader(body)
     });
   }catch(e){console.log("ntfy error:",e)}
 }
@@ -311,8 +312,8 @@ function checkAndNotify(){
         if(!m?.email)return;
         const topic=getNtfyTopic(m.email);
         if(topic)sendNtfy(topic,
-          `⏰ Task Due in ${mins} min`,
-          `"${t.title}" is due at ${t.dueTime}`,
+          "Task Due in "+mins+" min",
+          t.title+" - due at "+t.dueTime,
           "high","alarm_clock");
       });
     }
@@ -325,8 +326,8 @@ function checkAndNotify(){
         if(!m?.email)return;
         const topic=getNtfyTopic(m.email);
         if(topic)sendNtfy(topic,
-          `⚠️ Task Overdue!`,
-          `"${t.title}" was due at ${t.dueTime}`,
+          "Task Overdue!",
+          t.title+" - was due at "+t.dueTime,
           "urgent","warning");
       });
     }
@@ -339,8 +340,8 @@ function checkAndNotify(){
         if(!m?.email)return;
         const topic=getNtfyTopic(m.email);
         if(topic)sendNtfy(topic,
-          `🔔 Follow-up: Still pending`,
-          `"${t.title}" has been overdue for 1 hour`,
+          "Follow-up: Still pending",
+          t.title+" - has been overdue for 1 hour",
           "high","bell");
       });
     }
@@ -354,8 +355,8 @@ function checkAndNotify(){
     if(myTasks.length){
       const topic=getMyTopic();
       if(topic)sendNtfy(topic,
-        `📋 You have ${myTasks.length} task${myTasks.length>1?"s":""} due today`,
-        myTasks.map(t=>`• ${t.title}${t.dueTime?" at "+t.dueTime:""}`).join("\n"),
+        "You have "+myTasks.length+" task"+(myTasks.length>1?"s":"")+" due today",
+        myTasks.map(t=>t.title+(t.dueTime?" at "+t.dueTime:"")).join("\n"),
         "default","clipboard");
     }
   }
@@ -558,13 +559,14 @@ function stripAct(t){return t.replace(/###TASK_ACTION###[\s\S]*?###END_ACTION###
 // Notify assignees when a task is created/assigned
 function notifyAssignees(title,assignees,dueDate,dueTime,creatorName){
   (assignees||[]).forEach(aid=>{
-    if(aid===user?.uid)return; // don't notify yourself
+    if(aid===user?.uid)return;
     const m=S.members.find(x=>x.id===aid);
     if(!m?.email)return;
     const topic=getNtfyTopic(m.email);
+    const dueStr=dueDate?" - Due: "+fmtDT(dueDate,dueTime):"";
     if(topic)sendNtfy(topic,
-      `📋 New task assigned to you`,
-      `"${title}"${dueDate?" — Due: "+fmtDT(dueDate,dueTime):""}\nAssigned by ${creatorName}`,
+      "New task assigned to you",
+      title+dueStr+" - Assigned by "+creatorName,
       "default","inbox_tray");
   });
 }
